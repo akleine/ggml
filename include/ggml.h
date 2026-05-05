@@ -493,6 +493,10 @@ extern "C" {
         GGML_OP_CONV_TRANSPOSE_1D,
         GGML_OP_IM2COL,
         GGML_OP_IM2COL_BACK,
+#ifdef SD_USE_WINOGRAD
+        GGML_OP_WINOGRAD_PRE_ACT,
+        GGML_OP_WINOGRAD,
+#endif
         GGML_OP_CONV_TRANSPOSE_2D,
         GGML_OP_POOL_1D,
         GGML_OP_POOL_2D,
@@ -683,6 +687,7 @@ extern "C" {
         void * mem_buffer; // if NULL, memory will be allocated internally
         bool   no_alloc;   // don't allocate memory for the tensor data
     };
+
 
     // numa strategies
     enum ggml_numa_strategy {
@@ -1613,6 +1618,25 @@ extern "C" {
         int                   d0, // dilation dimension 0
         int                   d1, // dilation dimension 1
         bool                  is_2D);
+
+#ifdef SD_USE_WINOGRAD
+    GGML_API struct ggml_tensor * ggml_winograd_pre_act(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int p0, //padding
+            int p1,
+            enum ggml_type       dst_type);
+
+    GGML_API struct ggml_tensor * ggml_winograd(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * V, //precalculated V
+            int p0, //padding
+            int p1,
+            enum ggml_type       dst_type);
+#endif
 
     GGML_API struct ggml_tensor * ggml_conv_depthwise_2d(
             struct ggml_context * ctx,

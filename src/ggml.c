@@ -1,6 +1,14 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables ridiculous "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
+#ifdef SD_USE_WINOGRAD
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wpedantic"
+#ifdef __ARM_ARCH_7A__
+#define GGML_F16_EPR 2
+#endif
+#endif
+
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 #include "ggml.h"
@@ -261,8 +269,15 @@ void ggml_abort(const char * file, int line, const char * fmt, ...) {
 #define GGML_GELU_FP16
 #define GGML_GELU_QUICK_FP16
 
+
 #define GGML_SOFT_MAX_UNROLL 4
+
+#ifdef SD_USE_WINOGRAD
+#define GGML_VEC_DOT_UNROLL  4
+#else
 #define GGML_VEC_DOT_UNROLL  2
+#endif
+
 #define GGML_VEC_MAD_UNROLL  32
 
 //
@@ -2815,6 +2830,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CONV_TRANSPOSE_1D",
     "IM2COL",
     "IM2COL_BACK",
+#ifdef SD_USE_WINOGRAD
+    "WINOGRAD_PRE_ACT",
+    "WINOGRAD",
+#endif
     "CONV_TRANSPOSE_2D",
     "POOL_1D",
     "POOL_2D",
@@ -2851,9 +2870,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CROSS_ENTROPY_LOSS",
     "CROSS_ENTROPY_LOSS_BACK",
 };
-
+#ifdef SD_USE_WINOGRAD
+static_assert(GGML_OP_COUNT == 80, "GGML_OP_COUNT != 80");
+#else
 static_assert(GGML_OP_COUNT == 78, "GGML_OP_COUNT != 78");
-
+#endif
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
 
@@ -2907,6 +2928,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "conv_transpose_1d(x)",
     "im2col(x)",
     "im2col_back(x)",
+#ifdef SD_USE_WINOGRAD
+    "winograd_pre_act(x)",
+    "winograd(x)",
+#endif
     "conv_transpose_2d(x)",
     "pool_1d(x)",
     "pool_2d(x)",
@@ -2943,8 +2968,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "cross_entropy_loss(x,y)",
     "cross_entropy_loss_back(x,y)",
 };
-
+#ifdef SD_USE_WINOGRAD
+static_assert(GGML_OP_COUNT == 80, "GGML_OP_COUNT != 80");
+#else
 static_assert(GGML_OP_COUNT == 78, "GGML_OP_COUNT != 78");
+#endif
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6881,6 +6909,89 @@ struct ggml_tensor * ggml_im2col_back(
     return result;
 }
 
+#ifdef SD_USE_WINOGRAD
+struct ggml_tensor * ggml_winograd_pre_act(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * a, //kernel (filter/weight)
+    struct ggml_tensor  * b, //input (activation)
+    int p0, //get padding
+    int p1,
+    enum ggml_type       dst_type) {
+
+    UNUSED(dst_type);
+
+    bool is_node = false;
+
+    if (a->grad || b->grad) {
+        GGML_ASSERT(false); // TODO: implement backward
+        is_node = true;
+    }
+
+    const int64_t OW = b->ne[0] + (p0?0:-2); //apply only on filter size 3x3
+    const int64_t OH = b->ne[1] + (p1?0:-2);
+    const int64_t C = b->ne[2];
+
+    const int64_t P_h = OH/2 + OH%2;
+    const int64_t P_w = OW/2 + OW%2;
+    const int64_t P = P_h * P_w;
+
+    const int64_t ne[4] = {GGML_VEC_DOT_UNROLL*((C + GGML_F16_EPR - 1)/GGML_F16_EPR)*GGML_F16_EPR, 4, 4, P/GGML_VEC_DOT_UNROLL};
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F16, 4, ne);
+    int32_t params[] = {P_w, P_h, P, p0, p1};
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op = GGML_OP_WINOGRAD_PRE_ACT;
+    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_winograd(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * a, //kernel (filter)
+    struct ggml_tensor  * b, //input (activation)
+    struct ggml_tensor  * V, //precalculated V
+    int p0, //get padding
+    int p1,
+    enum ggml_type       dst_type) {
+
+    bool is_node = false;
+
+    if (a->grad || b->grad) {
+        GGML_ASSERT(false); // TODO: implement backward
+        is_node = true;
+    }
+
+    const int64_t OW = b->ne[0] + (p0?0:-2); //apply only on filter size 3x3
+    const int64_t OH = b->ne[1] + (p1?0:-2);
+    const int64_t C = b->ne[2];
+    const int64_t K = a->ne[3];
+
+    const int64_t ne[4] = {OW, OH, K, 1}; // 1 is batch size
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, dst_type, 4, ne);
+    int32_t params[] = {OW, OH, p0, p1};
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op = GGML_OP_WINOGRAD;
+    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    result->src[0] = a; // kernel
+    result->src[1] = b; // input (activation)
+
+    const int64_t neu[4] = {C, 4, 4, 32}; // 32 is max thread num
+    const int64_t nem[4] = {4, 4, GGML_VEC_DOT_UNROLL, 32}; // 32 is max thread num
+
+    result->src[2] = ggml_new_tensor(ctx, GGML_TYPE_F16, 4, neu);
+    result->src[3] = V;
+    result->src[4] = ggml_new_tensor(ctx, GGML_TYPE_F16, 4, nem);
+
+    return result;
+}
+#endif
+
 // a: [OC，IC, KH, KW]
 // b: [N, IC, IH, IW]
 // result: [N, OC, OH, OW]
@@ -6894,17 +7005,29 @@ struct ggml_tensor * ggml_conv_2d(
         int                  p1,
         int                  d0,
         int                  d1) {
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, s1, p0, p1, d0, d1, true, a->type); // [N, OH, OW, IC * KH * KW]
 
+#ifdef SD_USE_WINOGRAD
+    if (a->ne[0] == 3 && a->ne[1] == 3 &&
+        !(b->ne[0]%4) && !(b->ne[1]%4) &&
+        s0 == 1 && s1 == 1 && d0 == 1 && d1 == 1) {
+        // b (which is used to construct V) must be multiple of 4
+        // max thread number is 32
+        struct ggml_tensor * V = ggml_winograd_pre_act(ctx, a, b, p0, p1, GGML_TYPE_F16);
+        struct ggml_tensor * result = ggml_winograd(ctx, a, b, V, p0, p1, GGML_TYPE_F32);
+        printf("+");
+        return result;
+    }
+    printf("-");
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, s1, p0, p1, d0, d1, true, GGML_TYPE_F16); // [N, OH, OW, IC * KH * KW]
+#else
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, s1, p0, p1, d0, d1, true, a->type); // [N, OH, OW, IC * KH * KW]
+#endif
     struct ggml_tensor * result =
         ggml_mul_mat(ctx,
                 ggml_reshape_2d(ctx, im2col, im2col->ne[0],  im2col->ne[3] * im2col->ne[2] * im2col->ne[1]), // [N, OH, OW, IC * KH * KW] => [N*OH*OW, IC * KH * KW]
                 ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1] * a->ne[2]),  a->ne[3]));                       // [OC，IC, KH, KW] => [OC, IC * KH * KW]
-
     result = ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2], im2col->ne[3], a->ne[3]); // [OC, N, OH, OW]
     result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 1, 3, 2)); // [N, OC, OH, OW]
-
-
     return result;
 }
 
@@ -15034,6 +15157,325 @@ static void ggml_compute_forward_im2col_back_f32(
     }
 }
 
+
+inline static void ggml_vec_dot_f16_unroll_mem_layout(const int n, const int xs, float * restrict s, void * restrict xv, ggml_fp16_t * restrict y) {
+    ggml_float sumf[GGML_VEC_DOT_UNROLL] = { 0.0 };
+
+    ggml_fp16_t * restrict x[GGML_VEC_DOT_UNROLL];
+
+    for (int i = 0; i < GGML_VEC_DOT_UNROLL; ++i) {
+        x[i] = (ggml_fp16_t *) ((char *) xv + i*xs);
+    }
+
+#if defined(GGML_SIMD)
+    const int np = (n & ~(GGML_F16_STEP - 1));
+
+    GGML_F16_VEC sum[GGML_VEC_DOT_UNROLL][GGML_F16_ARR] = { { GGML_F16_VEC_ZERO } };
+
+    GGML_F16_VEC ax[GGML_F16_ARR];
+    GGML_F16_VEC ay[GGML_F16_ARR];
+
+    for (int i = 0; i < np; i += GGML_F16_STEP) {
+        for (int j = 0; j < GGML_F16_ARR; j++) {
+            ay[j] = GGML_F16_VEC_LOAD(y + i + j*GGML_F16_EPR, j);
+
+            for (int k = 0; k < GGML_VEC_DOT_UNROLL; ++k) {
+                // ax[j] = GGML_F16_VEC_LOAD(x[k] + i + j*GGML_F16_EPR, j);
+                ax[j] = GGML_F16_VEC_LOAD(x[0], j);
+                x[0] += GGML_F16_EPR;
+
+                sum[k][j] = GGML_F16_VEC_FMA(sum[k][j], ax[j], ay[j]);
+            }
+        }
+    }
+
+    // reduce sum0..sum3 to sum0
+    for (int k = 0; k < GGML_VEC_DOT_UNROLL; ++k) {
+        GGML_F16_VEC_REDUCE(sumf[k], sum[k]);
+    }
+
+    // design like this to ensure x[0] += GGML_F16_EPR
+    // leftovers (loop 8 elements)
+    int ii;
+    for (ii = np; ii + GGML_F16_EPR < n; ii+=GGML_F16_EPR) {
+        for (int j = 0; j < GGML_VEC_DOT_UNROLL; ++j) {
+            for(int k = 0; k < GGML_F16_EPR; ++k) {
+                sumf[j] += (ggml_float)(GGML_FP16_TO_FP32(x[0][k])*GGML_FP16_TO_FP32(y[ii+k]));
+            }
+            x[0] += GGML_F16_EPR;
+        }
+    }
+    //leftleftovers (loop 1 element)
+    for (int j = 0; j < GGML_VEC_DOT_UNROLL; ++j) {
+        for(int k = 0; ii+k < n; ++k) {
+            sumf[j] += (ggml_float)(GGML_FP16_TO_FP32(x[0][k])*GGML_FP16_TO_FP32(y[ii+k]));
+        }
+        x[0] += GGML_F16_EPR;
+    }
+
+#else
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < GGML_VEC_DOT_UNROLL; ++j) {
+            sumf[j] += (ggml_float)(GGML_FP16_TO_FP32(x[j][i])*GGML_FP16_TO_FP32(y[i]));
+        }
+    }
+#endif
+
+    for (int i = 0; i < GGML_VEC_DOT_UNROLL; ++i) {
+        s[i] = sumf[i];
+    }
+}
+
+
+#ifdef SD_USE_WINOGRAD
+static inline float16_t * data16const(const struct ggml_tensor * t, int n, int c, int h, int w){
+    return (float16_t *)((char *)t->data + n * t->nb[3] + c * t->nb[2] + h * t->nb[1] + w * t->nb[0]);
+}
+
+static inline float16_t * data16(struct ggml_tensor * t, int n, int c, int h, int w){
+    return (float16_t *)((char *)t->data + n * t->nb[3] + c * t->nb[2] + h * t->nb[1] + w * t->nb[0]);
+}
+
+static inline float * data32const(const struct ggml_tensor * t, int n, int c, int h, int w){
+    return (float *)((char *)t->data + n * t->nb[3] + c * t->nb[2] + h * t->nb[1] + w * t->nb[0]);
+}
+
+static inline float * data32(struct ggml_tensor * t, int n, int c, int h, int w){
+    return (float *)((char *)t->data + n * t->nb[3] + c * t->nb[2] + h * t->nb[1] + w * t->nb[0]);
+}
+
+static inline float data32val(const struct ggml_tensor * t, int n, int c, int h, int w){
+    if(n < 0 || n >= t->ne[3] || c < 0 || c >= t->ne[2] || h < 0 || h >= t->ne[1] || w < 0 || w >= t->ne[0]){
+        return 0;
+    }
+    return * data32const(t, n, c, h, w);
+}
+
+static void ggml_compute_forward_winograd_pre_act(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst,
+              struct ggml_compute_state * state) {
+
+    const struct ggml_tensor * src0 = dst->src[0]; //filter (not used actually)
+    const struct ggml_tensor * src1 = dst->src[1]; //activation
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+
+    const int32_t P_w = ((const int32_t *)(dst->op_params))[0]; // chunks of activation
+    // const int32_t P_h = ((const int32_t *)(dst->op_params))[1];
+    const int32_t P = ((const int32_t *)(dst->op_params))[2];
+    const int32_t p0 = ((const int32_t *)(dst->op_params))[3]; //padding
+    const int32_t p1 = ((const int32_t *)(dst->op_params))[4];
+
+    const int64_t C = ne12;
+    const int64_t W = ne10 + p0;
+    const int64_t H = ne11 + p1; // actually is +2*p for padding, but 1*p is enough as we start on (-p0, -p1)
+
+    if (ith == 0) {
+        atomic_store(&state->shared->current_chunk, nth);
+    }
+
+    {
+        const float B[4][4] = {
+            {1, 0, 0, 0},
+            {0, 1, -1, 1},
+            {-1, 1, 1, 0},
+            {0, 0, 0, -1}
+        };
+        const float Bt[4][4] = {
+            {1, 0, -1, 0},
+            {0, 1, 1, 0},
+            {0, -1, 1, 0},
+            {0, 1, 0, -1}
+        };
+
+
+        int p = ith; //on which thread
+
+        // V = Bt @ tiled_x @ B
+        while(p < P){
+            int start_h = (p / P_w) * 2 - p1; // -1 for padding, range is (-p, x + p), easier to detect for out ranged element
+            int start_w = (p % P_w) * 2 - p0;
+            if(start_h + 4 > H) start_h = H - 4;
+            if(start_w + 4 > W) start_w = W - 4;
+
+
+            for(int c = 0; c < C; ++c){
+                float temp[4][4];
+
+                // temp = Bt @ tiled_x
+                for(int i = 0; i < 4; ++i){
+                    for(int j = 0; j < 4; ++j){
+                        temp[i][j] = 0;
+                        for(int r = 0; r < 4; ++r){
+                            temp[i][j] += Bt[i][r] * data32val(src1, 0, c, start_h + r, start_w + j);
+                        }
+                    }
+                }
+
+
+                // V = temp @ B
+                const int32_t temp_p = p / GGML_VEC_DOT_UNROLL;
+                const int32_t temp_c = (c / GGML_F16_EPR) * GGML_VEC_DOT_UNROLL * GGML_F16_EPR + (p % GGML_VEC_DOT_UNROLL) * GGML_F16_EPR + (c % GGML_F16_EPR);
+
+                for(int i = 0; i < 4; ++i){
+                    for(int j = 0; j < 4; ++j){
+                        float s = 0;
+                        for(int r = 0; r < 4; ++r){
+                            s += temp[i][r] * B[r][j];
+                        }
+                        * data16(dst, temp_p, i, j, temp_c) = (float16_t)s;
+                    }
+                }
+            }
+            p = atomic_fetch_add(&state->shared->current_chunk, 1);
+        }
+    }
+}
+
+static void ggml_compute_forward_winograd(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst,
+              struct ggml_compute_state * state) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int32_t OW = ((const int32_t *)(dst->op_params))[0];
+    const int32_t OH = ((const int32_t *)(dst->op_params))[1];
+
+    const int64_t C = ne12;
+    const int64_t K = ne03;
+
+    if (ith == 0) {
+        atomic_store(&state->shared->current_chunk, nth);
+    }
+
+    {
+        const float G[4][3] = {
+            {1, 0, 0},
+            {0.5, 0.5, 0.5},
+            {0.5, -0.5, 0.5},
+            {0, 0, 1}
+        };
+        const float Gt[3][4] = {
+            {1, 0.5, 0.5, 0},
+            {0, 0.5, -0.5, 0},
+            {0, 0.5, 0.5, 1}
+        };
+        const float A[4][2] ={
+            {1,0},
+            {1,1},
+            {1,-1},
+            {0,-1}
+        };
+        const float At[2][4] = {
+            {1, 1, 1, 0},
+            {0, 1, -1, -1}
+        };
+
+        const int64_t P_h = OH/2 + OH%2;
+        const int64_t P_w = OW/2 + OW%2;
+        const int64_t P = P_h * P_w;
+
+        struct ggml_tensor * U = dst->src[2];
+        struct ggml_tensor * V = dst->src[3];
+        struct ggml_tensor * M = dst->src[4];
+
+
+        // M = U * V
+        int k = ith;
+        while(k < K){
+
+            // one U = G @ kernel @ Gt
+            for(int c = 0; c < C; ++c){
+                float temp[4][3] = {0};
+
+                // temp = G @ kernel
+                for(int i = 0; i < 4; ++i){
+                    for(int j = 0; j < 3; ++j){
+                        temp[i][j] = 0;
+                        for(int r = 0; r < 3; ++r){
+                            temp[i][j] += G[i][r] * (float)*data16const(src0, k, c, r, j);
+                        }
+                    }
+                }
+                // U = temp @ Gt
+                for(int i = 0; i < 4; ++i){
+                    for(int j = 0; j < 4; ++j){
+                        float s = 0;
+                        for(int r = 0; r < 3; ++r){
+                            s += temp[i][r] * Gt[r][j];
+                        }
+                        * data16(U, ith, i, j, c) = (float16_t)s;
+                    }
+                }
+            }
+
+
+            // elementwise multiplication and post processing
+            for(int p = 0; p < P; p=p+GGML_VEC_DOT_UNROLL){
+                for(int i = 0; i < 4; ++i){
+                    for(int j = 0; j < 4; ++j){
+
+                        float s[GGML_VEC_DOT_UNROLL];
+                        ggml_vec_dot_f16_unroll_mem_layout(C, 2*C, s, (ggml_fp16_t *)data16(V, p/GGML_VEC_DOT_UNROLL, i, j, 0), (ggml_fp16_t *)data16(U, ith, i, j, 0));
+                        // 2*C is 2bytes*C elements per row
+
+                        for(int ii = 0; ii < GGML_VEC_DOT_UNROLL; ++ii){
+                            * data16(M, ith, ii, i, j) = (float16_t)s[ii];
+                        }
+
+                    }
+                }
+
+
+                // Y = At @ M @ A
+                //matmul
+                for(int ii = 0; ii < GGML_VEC_DOT_UNROLL; ++ii){
+                    float temp[2][4] = {0};
+                    int start_h = ((p + ii) / P_w) * 2 ;
+                    int start_w = ((p + ii) % P_w) * 2 ;
+                    if(start_h + 2 > OH) start_h = OH - 2;
+                    if(start_w + 2 > OW) start_w = OW - 2;
+
+                    // temp = At @ M
+                    for(int i = 0; i < 2; ++i){
+                        for(int j = 0; j < 4; ++j){
+                            temp[i][j] = 0;
+                            for(int r = 0; r < 4; ++r){
+                                temp[i][j] += At[i][r] * (float)(* data16(M, ith, ii, r, j));
+                            }
+                        }
+                    }
+                    // result = temp @ A
+                    for(int i = 0; i < 2; ++i){
+                        for(int j = 0; j < 2; ++j){
+                            float s = 0;
+                            for(int r = 0; r < 4; ++r){
+                                s += temp[i][r] * A[r][j];
+                            }
+                            * data32(dst, 0, k, start_h + i, start_w + j) = s;
+                        }
+                    }
+                }
+
+            }
+
+            k = atomic_fetch_add(&state->shared->current_chunk, 1);
+        }
+    }
+}
+#endif
+
 // ggml_compute_forward_conv_transpose_2d
 
 static void ggml_compute_forward_conv_transpose_2d(
@@ -17088,9 +17530,11 @@ static void ggml_compute_forward_cross_entropy_loss_back(
     }
 }
 
-/////////////////////////////////
-
-static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
+static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor
+#ifdef SD_USE_WINOGRAD
+                                 , struct ggml_compute_state * state
+#endif
+  ) {
     GGML_ASSERT(params);
 
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
@@ -17290,6 +17734,16 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_im2col_back_f32(params, tensor);
             } break;
+#ifdef SD_USE_WINOGRAD
+        case GGML_OP_WINOGRAD_PRE_ACT:
+            {
+                ggml_compute_forward_winograd_pre_act(params, tensor, state);
+            } break;
+        case GGML_OP_WINOGRAD:
+            {
+                ggml_compute_forward_winograd(params, tensor, state);
+            } break;
+#endif
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
                 ggml_compute_forward_conv_transpose_2d(params, tensor);
@@ -18295,6 +18749,16 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
             }
+#ifdef SD_USE_WINOGRAD
+       case GGML_OP_WINOGRAD_PRE_ACT:
+            {
+             ////////////GGML_ASSERT(false); // TODO: not implemented
+            } break;
+       case GGML_OP_WINOGRAD:
+            {
+             ////////////GGML_ASSERT(false); // TODO: not implemented
+            } break;
+#endif
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
@@ -19039,6 +19503,16 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_IM2COL:
         case GGML_OP_IM2COL_BACK:
+#ifdef SD_USE_WINOGRAD
+        case GGML_OP_WINOGRAD_PRE_ACT:
+            {
+                n_tasks = n_threads;
+            } break;
+       case GGML_OP_WINOGRAD:
+            {
+                n_tasks = n_threads;
+            } break;
+#endif
         case GGML_OP_CONV_TRANSPOSE_1D:
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
@@ -19301,6 +19775,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
     return cplan;
 }
 
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
 
@@ -19320,7 +19795,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     for (int node_n = 0; node_n < cgraph->n_nodes; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
-        ggml_compute_forward(&params, node);
+        ggml_compute_forward(&params, node
+#ifdef SD_USE_WINOGRAD
+        , state
+#endif
+        );
 
         if (state->ith == 0 && cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
             state->shared->ec = GGML_STATUS_ABORTED;
