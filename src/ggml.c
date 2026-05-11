@@ -2,10 +2,12 @@
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
 #ifdef SD_USE_WINOGRAD
-#pragma GCC diagnostic ignored "-Wunused-variable"
 #pragma GCC diagnostic ignored "-Wpedantic"
 #ifdef __ARM_ARCH_7A__
 #define GGML_F16_EPR 2
+#endif
+#ifdef __x86_64__
+#define float16_t _Float16
 #endif
 #endif
 
@@ -6917,24 +6919,19 @@ struct ggml_tensor * ggml_winograd_pre_act(
     int p0, //get padding
     int p1,
     enum ggml_type       dst_type) {
-
     UNUSED(dst_type);
 
     bool is_node = false;
-
     if (a->grad || b->grad) {
         GGML_ASSERT(false); // TODO: implement backward
         is_node = true;
     }
-
     const int64_t OW = b->ne[0] + (p0?0:-2); //apply only on filter size 3x3
     const int64_t OH = b->ne[1] + (p1?0:-2);
     const int64_t C = b->ne[2];
-
     const int64_t P_h = OH/2 + OH%2;
     const int64_t P_w = OW/2 + OW%2;
     const int64_t P = P_h * P_w;
-
     const int64_t ne[4] = {GGML_VEC_DOT_UNROLL*((C + GGML_F16_EPR - 1)/GGML_F16_EPR)*GGML_F16_EPR, 4, 4, P/GGML_VEC_DOT_UNROLL};
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F16, 4, ne);
@@ -6945,7 +6942,6 @@ struct ggml_tensor * ggml_winograd_pre_act(
     result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
     result->src[0] = a;
     result->src[1] = b;
-
     return result;
 }
 
@@ -6959,7 +6955,6 @@ struct ggml_tensor * ggml_winograd(
     enum ggml_type       dst_type) {
 
     bool is_node = false;
-
     if (a->grad || b->grad) {
         GGML_ASSERT(false); // TODO: implement backward
         is_node = true;
@@ -6969,7 +6964,6 @@ struct ggml_tensor * ggml_winograd(
     const int64_t OH = b->ne[1] + (p1?0:-2);
     const int64_t C = b->ne[2];
     const int64_t K = a->ne[3];
-
     const int64_t ne[4] = {OW, OH, K, 1}; // 1 is batch size
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, dst_type, 4, ne);
@@ -6987,7 +6981,6 @@ struct ggml_tensor * ggml_winograd(
     result->src[2] = ggml_new_tensor(ctx, GGML_TYPE_F16, 4, neu);
     result->src[3] = V;
     result->src[4] = ggml_new_tensor(ctx, GGML_TYPE_F16, 4, nem);
-
     return result;
 }
 #endif
@@ -7014,10 +7007,10 @@ struct ggml_tensor * ggml_conv_2d(
         // max thread number is 32
         struct ggml_tensor * V = ggml_winograd_pre_act(ctx, a, b, p0, p1, GGML_TYPE_F16);
         struct ggml_tensor * result = ggml_winograd(ctx, a, b, V, p0, p1, GGML_TYPE_F32);
-        printf("+");
+        // printf("+");
         return result;
     }
-    printf("-");
+    // printf("-");
     struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, s1, p0, p1, d0, d1, true, GGML_TYPE_F16); // [N, OH, OW, IC * KH * KW]
 #else
     struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, s1, p0, p1, d0, d1, true, a->type); // [N, OH, OW, IC * KH * KW]
@@ -15264,7 +15257,6 @@ static void ggml_compute_forward_winograd_pre_act(
     const int ith = params->ith;
     const int nth = params->nth;
 
-
     const int32_t P_w = ((const int32_t *)(dst->op_params))[0]; // chunks of activation
     // const int32_t P_h = ((const int32_t *)(dst->op_params))[1];
     const int32_t P = ((const int32_t *)(dst->op_params))[2];
@@ -15278,7 +15270,6 @@ static void ggml_compute_forward_winograd_pre_act(
     if (ith == 0) {
         atomic_store(&state->shared->current_chunk, nth);
     }
-
     {
         const float B[4][4] = {
             {1, 0, 0, 0},
@@ -15292,10 +15283,7 @@ static void ggml_compute_forward_winograd_pre_act(
             {0, -1, 1, 0},
             {0, 1, 0, -1}
         };
-
-
         int p = ith; //on which thread
-
         // V = Bt @ tiled_x @ B
         while(p < P){
             int start_h = (p / P_w) * 2 - p1; // -1 for padding, range is (-p, x + p), easier to detect for out ranged element
@@ -15303,10 +15291,8 @@ static void ggml_compute_forward_winograd_pre_act(
             if(start_h + 4 > H) start_h = H - 4;
             if(start_w + 4 > W) start_w = W - 4;
 
-
             for(int c = 0; c < C; ++c){
                 float temp[4][4];
-
                 // temp = Bt @ tiled_x
                 for(int i = 0; i < 4; ++i){
                     for(int j = 0; j < 4; ++j){
@@ -15316,12 +15302,9 @@ static void ggml_compute_forward_winograd_pre_act(
                         }
                     }
                 }
-
-
                 // V = temp @ B
                 const int32_t temp_p = p / GGML_VEC_DOT_UNROLL;
                 const int32_t temp_c = (c / GGML_F16_EPR) * GGML_VEC_DOT_UNROLL * GGML_F16_EPR + (p % GGML_VEC_DOT_UNROLL) * GGML_F16_EPR + (c % GGML_F16_EPR);
-
                 for(int i = 0; i < 4; ++i){
                     for(int j = 0; j < 4; ++j){
                         float s = 0;
@@ -15348,17 +15331,14 @@ static void ggml_compute_forward_winograd(
 
     const int ith = params->ith;
     const int nth = params->nth;
-
     const int32_t OW = ((const int32_t *)(dst->op_params))[0];
     const int32_t OH = ((const int32_t *)(dst->op_params))[1];
-
     const int64_t C = ne12;
     const int64_t K = ne03;
 
     if (ith == 0) {
         atomic_store(&state->shared->current_chunk, nth);
     }
-
     {
         const float G[4][3] = {
             {1, 0, 0},
@@ -15385,20 +15365,16 @@ static void ggml_compute_forward_winograd(
         const int64_t P_h = OH/2 + OH%2;
         const int64_t P_w = OW/2 + OW%2;
         const int64_t P = P_h * P_w;
-
         struct ggml_tensor * U = dst->src[2];
         struct ggml_tensor * V = dst->src[3];
         struct ggml_tensor * M = dst->src[4];
 
-
         // M = U * V
         int k = ith;
         while(k < K){
-
             // one U = G @ kernel @ Gt
             for(int c = 0; c < C; ++c){
                 float temp[4][3] = {0};
-
                 // temp = G @ kernel
                 for(int i = 0; i < 4; ++i){
                     for(int j = 0; j < 3; ++j){
@@ -15419,8 +15395,6 @@ static void ggml_compute_forward_winograd(
                     }
                 }
             }
-
-
             // elementwise multiplication and post processing
             for(int p = 0; p < P; p=p+GGML_VEC_DOT_UNROLL){
                 for(int i = 0; i < 4; ++i){
@@ -15433,11 +15407,8 @@ static void ggml_compute_forward_winograd(
                         for(int ii = 0; ii < GGML_VEC_DOT_UNROLL; ++ii){
                             * data16(M, ith, ii, i, j) = (float16_t)s[ii];
                         }
-
                     }
                 }
-
-
                 // Y = At @ M @ A
                 //matmul
                 for(int ii = 0; ii < GGML_VEC_DOT_UNROLL; ++ii){
@@ -15467,9 +15438,7 @@ static void ggml_compute_forward_winograd(
                         }
                     }
                 }
-
             }
-
             k = atomic_fetch_add(&state->shared->current_chunk, 1);
         }
     }
@@ -18752,11 +18721,11 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
 #ifdef SD_USE_WINOGRAD
        case GGML_OP_WINOGRAD_PRE_ACT:
             {
-             ////////////GGML_ASSERT(false); // TODO: not implemented
+             // GGML_ASSERT(false); // TODO: not implemented
             } break;
        case GGML_OP_WINOGRAD:
             {
-             ////////////GGML_ASSERT(false); // TODO: not implemented
+             // GGML_ASSERT(false); // TODO: not implemented
             } break;
 #endif
         case GGML_OP_CONV_TRANSPOSE_2D:
@@ -19505,13 +19474,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_IM2COL_BACK:
 #ifdef SD_USE_WINOGRAD
         case GGML_OP_WINOGRAD_PRE_ACT:
-            {
-                n_tasks = n_threads;
-            } break;
-       case GGML_OP_WINOGRAD:
-            {
-                n_tasks = n_threads;
-            } break;
+        case GGML_OP_WINOGRAD:
 #endif
         case GGML_OP_CONV_TRANSPOSE_1D:
         case GGML_OP_CONV_TRANSPOSE_2D:
