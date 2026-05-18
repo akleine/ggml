@@ -1,3 +1,10 @@
+This GGML branch is intended for use by the **stable-diffusion.cpp-JetsonNano** project.
+
+*Many thanks for this excellent work to ggerganov and a lot of contributors there!*
+
+***
+# *Original ```README.md``` follows here*
+***
 # ggml
 
 [Roadmap](https://github.com/users/ggerganov/projects/7) / [Manifesto](https://github.com/ggerganov/llama.cpp/discussions/205)
